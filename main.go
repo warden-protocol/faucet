@@ -176,7 +176,8 @@ func main() {
 			logger.Error().Msgf("error sending tokens: %s", err)
 
 			formData := newFormData()
-			formData.Address = ""
+			formData.Address = c.FormValue("address") // Preserve the entered address
+			formData.CSRFToken = c.Get("csrf").(string) // Include CSRF token
 			formData.Errors["address"] = err.Error()
 
 			return c.Render(httpStatusCode, "form", formData)
@@ -188,7 +189,10 @@ func main() {
 
 			logger.Info().Msgf("txHash: %s", txHash)
 
-			return c.Render(http.StatusOK, "form", nil)
+			// Return a fresh form with new CSRF token for next submission
+			formData := newFormData()
+			formData.CSRFToken = c.Get("csrf").(string)
+			return c.Render(http.StatusOK, "form", formData)
 		}
 
 		return c.Render(http.StatusOK, "tx-status", "")

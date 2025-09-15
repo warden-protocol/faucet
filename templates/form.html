@@ -1,9 +1,10 @@
 {{ block "form" . }}
 <form
+  hx-post="/send-tokens"
   hx-swap="outerHTML"
   hx-headers='{"X-CSRF-Token": "{{ .CSRFToken }}"}'
-  hx-post="/send-tokens"
-  hx-swap="innerHTML"
+  hx-target="this"
+  hx-indicator="#spinner"
 >
   <input
     type="text"
@@ -15,6 +16,6 @@
   {{ if .Errors.address }}
   <div class="error-message">{{ .Errors.address }}</div>
   {{ end }}
-  <input style="button" type="submit" />
+  <input type="submit" value="Submit" />
 </form>
 {{ end }}

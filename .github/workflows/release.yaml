@@ -61,6 +61,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.sha }}
-            ghcr.io/${{ github.repository }}:${{ steps.release-please.outputs.tag_name }}
+            ghcr.io/${{ github.repository }}:${{
+              steps.release-please.outputs.tag_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
