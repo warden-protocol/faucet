@@ -22,6 +22,8 @@ import (
 	"github.com/warden-protocol/faucet/pkg/config"
 )
 
+const multiplyNumber = 1
+
 type Faucet struct {
 	*sync.Mutex
 
@@ -108,38 +110,146 @@ func convertCosmosToEVM(bech32Addr string) (string, error) {
 	return addr.Hex(), nil
 }
 
-// getAndIncrementNonce safely gets a nonce and reserves the next N nonces
+// getAndIncrementNonce safely gets a nonce and reserves the next N nonces with production-ready handling
 func (f *Faucet) getAndIncrementNonce(ctx context.Context, count uint64) (uint64, error) {
 	f.nonceMutex.Lock()
 	defer f.nonceMutex.Unlock()
 
-	// Get fresh nonce from network to avoid conflicts
-	pendingNonce, err := f.client.PendingNonceAt(ctx, f.fromAddress)
+	// Wait for any pending transactions to clear in production environments
+	maxWait := 30 * time.Second
+	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+
+	var pendingNonce uint64
+	var confirmedNonce uint64
+	var err error
+
+	// Retry getting nonces with backoff for network reliability
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+
+		pendingNonce, err = f.client.PendingNonceAt(waitCtx, f.fromAddress)
+		if err != nil {
+			f.log.Warn().Msgf("attempt %d: failed to get pending nonce: %v", attempt+1, err)
+			continue
+		}
+
+		confirmedNonce, err = f.client.NonceAt(waitCtx, f.fromAddress, nil)
+		if err != nil {
+			f.log.Warn().Msgf("attempt %d: failed to get confirmed nonce: %v", attempt+1, err)
+			// Continue with pending nonce if confirmed fails
+		} else if pendingNonce < confirmedNonce {
+			f.log.Warn().Msgf("pending nonce %d is less than confirmed nonce %d, using confirmed",
+				pendingNonce, confirmedNonce)
+			pendingNonce = confirmedNonce
+		}
+		break
+	}
+
 	if err != nil {
-		return 0, fmt.Errorf("failed to get pending nonce: %w", err)
+		return 0, fmt.Errorf("failed to get nonce after 3 attempts: %w", err)
 	}
 
-	// Also check confirmed nonce as backup
-	confirmedNonce, err := f.client.NonceAt(ctx, f.fromAddress, nil)
-	if err != nil {
-		f.log.Warn().Msgf("failed to get confirmed nonce: %v", err)
-	} else if pendingNonce < confirmedNonce {
-		f.log.Warn().Msgf("pending nonce %d is less than confirmed nonce %d, using confirmed", 
-			pendingNonce, confirmedNonce)
-		pendingNonce = confirmedNonce
+	// In production, be more conservative with nonce management
+	// Always use the maximum of tracked, pending, and confirmed nonces
+	maxNonce := pendingNonce
+	if confirmedNonce > maxNonce {
+		maxNonce = confirmedNonce
+	}
+	if f.nonce > maxNonce {
+		maxNonce = f.nonce
 	}
 
-	// Use the maximum of our tracked nonce and the network nonce
-	if pendingNonce > f.nonce {
-		f.log.Debug().Msgf("updating tracked nonce from %d to %d", f.nonce, pendingNonce)
-		f.nonce = pendingNonce
+	// If there's a significant gap, log it as it might indicate stuck transactions
+	if maxNonce > f.nonce+10 {
+		f.log.Warn().Msgf("large nonce gap detected: tracked=%d, network=%d", f.nonce, maxNonce)
 	}
 
+	f.nonce = maxNonce
 	currentNonce := f.nonce
-	f.nonce += count // Reserve the next 'count' nonces
+	f.nonce += count
 
-	f.log.Debug().Msgf("allocated nonce range %d-%d", currentNonce, currentNonce+count-1)
+	f.log.Info().Msgf("allocated nonce range %d-%d (confirmed: %d, pending: %d)",
+		currentNonce, currentNonce+count-1, confirmedNonce, pendingNonce)
 	return currentNonce, nil
+}
+
+// waitForTransactionReceipt waits for a transaction to be mined and returns its receipt
+func (f *Faucet) waitForTransactionReceipt(
+	ctx context.Context,
+	txHash common.Hash,
+	timeout time.Duration,
+) error {
+	f.log.Debug().Msgf("waiting for transaction receipt: %s", txHash.Hex())
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("transaction %s not mined within %v", txHash.Hex(), timeout)
+		case <-ticker.C:
+			receipt, err := f.client.TransactionReceipt(waitCtx, txHash)
+			if err != nil {
+				// Transaction not yet mined, continue waiting
+				continue
+			}
+
+			if receipt.Status == 0 {
+				return fmt.Errorf("transaction %s failed (status: 0)", txHash.Hex())
+			}
+
+			f.log.Info().
+				Msgf("transaction %s confirmed in block %d", txHash.Hex(), receipt.BlockNumber.Uint64())
+			return nil
+		}
+	}
+}
+
+// validateProductionConfig checks if the configuration is suitable for production
+func validateProductionConfig(cfg config.Config, logger zerolog.Logger) {
+	warnings := []string{}
+
+	if cfg.BatchInterval < 30*time.Second {
+		warnings = append(
+			warnings,
+			fmt.Sprintf(
+				"BatchInterval (%v) is very short, consider at least 30s for production",
+				cfg.BatchInterval,
+			),
+		)
+	}
+
+	if cfg.BatchLimit > 10 {
+		warnings = append(
+			warnings,
+			fmt.Sprintf(
+				"BatchLimit (%d) is high, consider reducing for better reliability",
+				cfg.BatchLimit,
+			),
+		)
+	}
+
+	if cfg.DailyLimit > 100000 {
+		warnings = append(
+			warnings,
+			fmt.Sprintf("DailyLimit (%.0f) is very high, ensure sufficient funds", cfg.DailyLimit),
+		)
+	}
+
+	for _, warning := range warnings {
+		logger.Warn().Msg(warning)
+	}
+
+	if len(warnings) > 0 {
+		logger.Info().Msg("Consider adjusting configuration for production environment")
+	}
 }
 
 func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
@@ -147,6 +257,9 @@ func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
 	if err != nil {
 		logger.Fatal().Msgf("error loading config: %s", err)
 	}
+
+	// Validate production configuration
+	validateProductionConfig(cfg, logger)
 
 	// Connect to the Ethereum client
 	client, err := ethclient.Dial(cfg.Node)
@@ -258,8 +371,8 @@ func (f *Faucet) Send(ctx context.Context, addr string, force bool) (string, int
 // sendBatch sends tokens to multiple addresses with robust retry logic
 func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, float64, error) {
 	const maxRetries = 5
-	const baseGasPriceMultiplier = 1.5 // Start with 50% increase
-	const maxGasPriceMultiplier = 3.0  // Cap at 3x original price
+	const baseGasPriceMultiplier = 2.0 // Start with 100% increase for production
+	const maxGasPriceMultiplier = 20.0 // Cap at 20x for replacement transactions
 
 	var lastErr error
 	addressCount := uint64(len(addresses))
@@ -267,7 +380,9 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 	for retry := 0; retry < maxRetries; retry++ {
 		// Wait before retry to avoid rapid successive failures and let the network settle
 		if retry > 0 {
-			waitTime := time.Duration(retry*retry) * time.Second // Exponential backoff: 1s, 4s, 9s, 16s
+			waitTime := time.Duration(
+				retry*retry,
+			) * time.Second // Exponential backoff: 1s, 4s, 9s, 16s
 			f.log.Info().Msgf("waiting %v before retry %d", waitTime, retry+1)
 			time.Sleep(waitTime)
 		}
@@ -280,7 +395,8 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 			continue
 		}
 
-		f.log.Debug().Msgf("retry %d: using nonce range %d-%d", retry+1, nonce, nonce+addressCount-1)
+		f.log.Debug().
+			Msgf("retry %d: using nonce range %d-%d", retry+1, nonce, nonce+addressCount-1)
 
 		// Get current gas price and increase significantly on retries
 		gasPrice, err := f.client.SuggestGasPrice(ctx)
@@ -290,9 +406,12 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 			continue
 		}
 
-		// Increase gas price more aggressively on retries
+		// Increase gas price more aggressively on retries for production
 		if retry > 0 {
-			multiplier := baseGasPriceMultiplier + float64(retry)*0.3 // 1.5x, 1.8x, 2.1x, 2.4x
+			// More aggressive scaling: 2x, 4x, 8x, 16x, 20x
+			multiplier := baseGasPriceMultiplier * float64(
+				int64(multiplyNumber)<<retry,
+			) // Exponential increase
 			if multiplier > maxGasPriceMultiplier {
 				multiplier = maxGasPriceMultiplier
 			}
@@ -302,19 +421,24 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 			gasPriceFloat.Mul(gasPriceFloat, big.NewFloat(multiplier))
 			gasPrice, _ = gasPriceFloat.Int(nil)
 
-			f.log.Info().Msgf("retry %d: increasing gas price from %s to %s (%.1fx)", 
-				retry+1, originalGasPrice.String(), gasPrice.String(), multiplier)
+			f.log.Warn().
+				Msgf("retry %d: aggressively increasing gas price from %s to %s (%.1fx) for replacement",
+					retry+1, originalGasPrice.String(), gasPrice.String(), multiplier)
 		}
 
 		txHash, totalSent, err := f.sendBatchTransaction(ctx, addresses, gasPrice, nonce)
 		if err != nil {
 			lastErr = err
 			f.log.Warn().Msgf("batch send attempt %d failed: %v", retry+1, err)
-			
+
 			// Check if it's a nonce-related error and force a longer wait
-			if strings.Contains(err.Error(), "nonce") || strings.Contains(err.Error(), "replacement") {
-				f.log.Warn().Msgf("nonce conflict detected, forcing longer wait")
-				time.Sleep(5 * time.Second)
+			if strings.Contains(err.Error(), "nonce") ||
+				strings.Contains(err.Error(), "replacement") ||
+				strings.Contains(err.Error(), "underpriced") {
+				waitTime := time.Duration(retry+1) * 10 * time.Second // 10s, 20s, 30s, 40s
+				f.log.Warn().
+					Msgf("nonce/replacement conflict detected, waiting %v before next attempt", waitTime)
+				time.Sleep(waitTime)
 			}
 			continue
 		}
@@ -323,7 +447,28 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 		return txHash, totalSent, nil
 	}
 
-	return "", 0, fmt.Errorf("failed after %d retries, last error: %w", maxRetries, lastErr)
+	// Categorize the final error for better debugging
+	errType := "unknown"
+	if strings.Contains(lastErr.Error(), "nonce") {
+		errType = "nonce_conflict"
+	} else if strings.Contains(lastErr.Error(), "replacement") || strings.Contains(lastErr.Error(), "underpriced") {
+		errType = "replacement_underpriced"
+	} else if strings.Contains(lastErr.Error(), "insufficient") {
+		errType = "insufficient_funds"
+	} else if strings.Contains(lastErr.Error(), "gas") {
+		errType = "gas_related"
+	} else if strings.Contains(lastErr.Error(), "timeout") || strings.Contains(lastErr.Error(), "context") {
+		errType = "network_timeout"
+	}
+
+	f.log.Error().
+		Msgf("batch transaction failed permanently (type: %s) after %d retries: %v", errType, maxRetries, lastErr)
+	return "", 0, fmt.Errorf(
+		"failed after %d retries (error_type: %s), last error: %w",
+		maxRetries,
+		errType,
+		lastErr,
+	)
 }
 
 // sendBatchTransaction creates and sends a batch transaction to multiple addresses
@@ -387,16 +532,25 @@ func (f *Faucet) sendBatchTransaction(
 			continue
 		}
 
+		txHash := signedTx.Hash()
+		f.log.Info().Msgf("transaction submitted to %s: %s", evmAddress, txHash.Hex())
+
+		// Wait for transaction to be mined (with shorter timeout for individual txs)
+		if err := f.waitForTransactionReceipt(ctx, txHash, 60*time.Second); err != nil {
+			f.log.Error().Msgf("transaction to %s failed to confirm: %v", evmAddress, err)
+			continue
+		}
+
 		successfulAddresses = append(successfulAddresses, address)
 		totalSent += f.Amount
-		lastTxHash = signedTx.Hash().Hex()
+		lastTxHash = txHash.Hex()
 
 		// Log both original and converted address for transparency
 		if address != evmAddress {
 			f.log.Info().
-				Msgf("sent %f %s to %s (converted from %s), tx: %s", f.Amount, f.config.Denom, evmAddress, address, lastTxHash)
+				Msgf("confirmed %f %s to %s (converted from %s), tx: %s", f.Amount, f.config.Denom, evmAddress, address, lastTxHash)
 		} else {
-			f.log.Info().Msgf("sent %f %s to %s, tx: %s", f.Amount, f.config.Denom, evmAddress, lastTxHash)
+			f.log.Info().Msgf("confirmed %f %s to %s, tx: %s", f.Amount, f.config.Denom, evmAddress, lastTxHash)
 		}
 	}
 

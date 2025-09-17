@@ -176,7 +176,7 @@ func main() {
 			logger.Error().Msgf("error sending tokens: %s", err)
 
 			formData := newFormData()
-			formData.Address = c.FormValue("address") // Preserve the entered address
+			formData.Address = c.FormValue("address")   // Preserve the entered address
 			formData.CSRFToken = c.Get("csrf").(string) // Include CSRF token
 			formData.Errors["address"] = err.Error()
 
