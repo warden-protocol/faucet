@@ -37,6 +37,7 @@ type Faucet struct {
 	LatestTXHash    string
 	DisplayTokens   bool
 	nonce           uint64
+	nonceMutex      sync.Mutex // Separate mutex for nonce management
 }
 
 const (
@@ -105,6 +106,40 @@ func convertCosmosToEVM(bech32Addr string) (string, error) {
 	}
 
 	return addr.Hex(), nil
+}
+
+// getAndIncrementNonce safely gets a nonce and reserves the next N nonces
+func (f *Faucet) getAndIncrementNonce(ctx context.Context, count uint64) (uint64, error) {
+	f.nonceMutex.Lock()
+	defer f.nonceMutex.Unlock()
+
+	// Get fresh nonce from network to avoid conflicts
+	pendingNonce, err := f.client.PendingNonceAt(ctx, f.fromAddress)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get pending nonce: %w", err)
+	}
+
+	// Also check confirmed nonce as backup
+	confirmedNonce, err := f.client.NonceAt(ctx, f.fromAddress, nil)
+	if err != nil {
+		f.log.Warn().Msgf("failed to get confirmed nonce: %v", err)
+	} else if pendingNonce < confirmedNonce {
+		f.log.Warn().Msgf("pending nonce %d is less than confirmed nonce %d, using confirmed", 
+			pendingNonce, confirmedNonce)
+		pendingNonce = confirmedNonce
+	}
+
+	// Use the maximum of our tracked nonce and the network nonce
+	if pendingNonce > f.nonce {
+		f.log.Debug().Msgf("updating tracked nonce from %d to %d", f.nonce, pendingNonce)
+		f.nonce = pendingNonce
+	}
+
+	currentNonce := f.nonce
+	f.nonce += count // Reserve the next 'count' nonces
+
+	f.log.Debug().Msgf("allocated nonce range %d-%d", currentNonce, currentNonce+count-1)
+	return currentNonce, nil
 }
 
 func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
@@ -220,48 +255,66 @@ func (f *Faucet) Send(ctx context.Context, addr string, force bool) (string, int
 	return txHash, http.StatusOK, nil
 }
 
-// sendBatch sends tokens to multiple addresses in a single transaction with retry logic
+// sendBatch sends tokens to multiple addresses with robust retry logic
 func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, float64, error) {
-	const maxRetries = 3
-	const gasPriceMultiplier = 1.2 // Increase gas price by 20% on retry
+	const maxRetries = 5
+	const baseGasPriceMultiplier = 1.5 // Start with 50% increase
+	const maxGasPriceMultiplier = 3.0  // Cap at 3x original price
 
 	var lastErr error
+	addressCount := uint64(len(addresses))
 
 	for retry := 0; retry < maxRetries; retry++ {
-		// Get fresh nonce for each retry to avoid conflicts
-		nonce, err := f.client.PendingNonceAt(ctx, f.fromAddress)
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to get nonce: %w", err)
+		// Wait before retry to avoid rapid successive failures and let the network settle
+		if retry > 0 {
+			waitTime := time.Duration(retry*retry) * time.Second // Exponential backoff: 1s, 4s, 9s, 16s
+			f.log.Info().Msgf("waiting %v before retry %d", waitTime, retry+1)
+			time.Sleep(waitTime)
 		}
-		f.nonce = nonce
 
-		// Get current gas price and increase if retrying
+		// Get fresh nonce range for this batch
+		nonce, err := f.getAndIncrementNonce(ctx, addressCount)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to get nonce: %w", err)
+			f.log.Error().Msgf("retry %d: %v", retry+1, lastErr)
+			continue
+		}
+
+		f.log.Debug().Msgf("retry %d: using nonce range %d-%d", retry+1, nonce, nonce+addressCount-1)
+
+		// Get current gas price and increase significantly on retries
 		gasPrice, err := f.client.SuggestGasPrice(ctx)
 		if err != nil {
-			return "", 0, fmt.Errorf("failed to suggest gas price: %w", err)
+			lastErr = fmt.Errorf("failed to suggest gas price: %w", err)
+			f.log.Error().Msgf("retry %d: %v", retry+1, lastErr)
+			continue
 		}
 
-		// Increase gas price on retries to avoid "underpriced" errors
+		// Increase gas price more aggressively on retries
 		if retry > 0 {
-			multiplier := new(big.Float).SetFloat64(gasPriceMultiplier)
-			for i := 0; i < retry; i++ {
-				multiplier.Mul(multiplier, big.NewFloat(gasPriceMultiplier))
+			multiplier := baseGasPriceMultiplier + float64(retry)*0.3 // 1.5x, 1.8x, 2.1x, 2.4x
+			if multiplier > maxGasPriceMultiplier {
+				multiplier = maxGasPriceMultiplier
 			}
+
+			originalGasPrice := new(big.Int).Set(gasPrice)
 			gasPriceFloat := new(big.Float).SetInt(gasPrice)
-			gasPriceFloat.Mul(gasPriceFloat, multiplier)
+			gasPriceFloat.Mul(gasPriceFloat, big.NewFloat(multiplier))
 			gasPrice, _ = gasPriceFloat.Int(nil)
 
-			f.log.Info().Msgf("retry %d: increasing gas price to %s", retry+1, gasPrice.String())
+			f.log.Info().Msgf("retry %d: increasing gas price from %s to %s (%.1fx)", 
+				retry+1, originalGasPrice.String(), gasPrice.String(), multiplier)
 		}
 
 		txHash, totalSent, err := f.sendBatchTransaction(ctx, addresses, gasPrice, nonce)
 		if err != nil {
 			lastErr = err
 			f.log.Warn().Msgf("batch send attempt %d failed: %v", retry+1, err)
-
-			// Wait before retry to avoid rapid successive failures
-			if retry < maxRetries-1 {
-				time.Sleep(time.Duration(retry+1) * time.Second)
+			
+			// Check if it's a nonce-related error and force a longer wait
+			if strings.Contains(err.Error(), "nonce") || strings.Contains(err.Error(), "replacement") {
+				f.log.Warn().Msgf("nonce conflict detected, forcing longer wait")
+				time.Sleep(5 * time.Second)
 			}
 			continue
 		}
@@ -347,8 +400,7 @@ func (f *Faucet) sendBatchTransaction(
 		}
 	}
 
-	// Update nonce to the last used nonce + 1
-	f.nonce = nonce + uint64(len(successfulAddresses))
+	// Don't update the internal nonce here - it was already reserved in getAndIncrementNonce
 
 	if len(successfulAddresses) == 0 {
 		return "", 0, errors.New("failed to send to any addresses")
