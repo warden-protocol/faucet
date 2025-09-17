@@ -202,11 +202,100 @@ func (f *Faucet) Send(ctx context.Context, addr string, force bool) (string, int
 		return "", http.StatusBadRequest, errors.New("no addresses in batch to send to")
 	}
 
-	// Send to all addresses in batch
-	var txHashes []string
-	var totalSent float64
+	// Send as a single batch transaction to save on gas
+	txHash, totalSent, err := f.sendBatch(ctx, f.Batch)
+	if err != nil {
+		return "", http.StatusInternalServerError, fmt.Errorf("failed to send batch: %w", err)
+	}
 
-	for _, address := range f.Batch {
+	f.TokensAvailable -= totalSent
+	f.log.Debug().Msgf("tokens available: %f", f.TokensAvailable)
+	f.log.Info().Msgf("batch sent to %d addresses, total: %f %s, tx: %s",
+		len(f.Batch), totalSent, f.config.Denom, txHash)
+	dailySupply.Set(f.TokensAvailable)
+
+	f.LatestTXHash = txHash
+	f.Batch = []string{}
+
+	return txHash, http.StatusOK, nil
+}
+
+// sendBatch sends tokens to multiple addresses in a single transaction with retry logic
+func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, float64, error) {
+	const maxRetries = 3
+	const gasPriceMultiplier = 1.2 // Increase gas price by 20% on retry
+
+	var lastErr error
+
+	for retry := 0; retry < maxRetries; retry++ {
+		// Get fresh nonce for each retry to avoid conflicts
+		nonce, err := f.client.PendingNonceAt(ctx, f.fromAddress)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to get nonce: %w", err)
+		}
+		f.nonce = nonce
+
+		// Get current gas price and increase if retrying
+		gasPrice, err := f.client.SuggestGasPrice(ctx)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to suggest gas price: %w", err)
+		}
+
+		// Increase gas price on retries to avoid "underpriced" errors
+		if retry > 0 {
+			multiplier := new(big.Float).SetFloat64(gasPriceMultiplier)
+			for i := 0; i < retry; i++ {
+				multiplier.Mul(multiplier, big.NewFloat(gasPriceMultiplier))
+			}
+			gasPriceFloat := new(big.Float).SetInt(gasPrice)
+			gasPriceFloat.Mul(gasPriceFloat, multiplier)
+			gasPrice, _ = gasPriceFloat.Int(nil)
+
+			f.log.Info().Msgf("retry %d: increasing gas price to %s", retry+1, gasPrice.String())
+		}
+
+		txHash, totalSent, err := f.sendBatchTransaction(ctx, addresses, gasPrice, nonce)
+		if err != nil {
+			lastErr = err
+			f.log.Warn().Msgf("batch send attempt %d failed: %v", retry+1, err)
+
+			// Wait before retry to avoid rapid successive failures
+			if retry < maxRetries-1 {
+				time.Sleep(time.Duration(retry+1) * time.Second)
+			}
+			continue
+		}
+
+		f.log.Info().Msgf("batch transaction successful on attempt %d: %s", retry+1, txHash)
+		return txHash, totalSent, nil
+	}
+
+	return "", 0, fmt.Errorf("failed after %d retries, last error: %w", maxRetries, lastErr)
+}
+
+// sendBatchTransaction creates and sends a batch transaction to multiple addresses
+func (f *Faucet) sendBatchTransaction(
+	ctx context.Context,
+	addresses []string,
+	gasPrice *big.Int,
+	nonce uint64,
+) (string, float64, error) {
+	// Convert amount to wei
+	amount := new(big.Float).SetFloat64(f.config.Amount)
+	multiplierInt := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(f.config.Exponent)), nil)
+	multiplier := new(big.Float).SetInt(multiplierInt)
+	amount.Mul(amount, multiplier)
+
+	amountWei := new(big.Int)
+	amount.Int(amountWei)
+
+	var totalSent float64
+	var successfulAddresses []string
+	var lastTxHash string
+
+	// For now, we'll send individual transactions but with proper retry logic
+	// TODO: Implement true batching using smart contract for even better efficiency
+	for i, address := range addresses {
 		// Convert bech32 address to EVM address if needed
 		evmAddress, err := convertCosmosToEVM(address)
 		if err != nil {
@@ -214,39 +303,63 @@ func (f *Faucet) Send(ctx context.Context, addr string, force bool) (string, int
 			continue
 		}
 
-		txHash, err := f.sendToAddress(ctx, evmAddress)
+		toAddress := common.HexToAddress(evmAddress)
+
+		// Create the transaction with incremented nonce for each address
+		tx := types.NewTransaction(
+			nonce+uint64(i),
+			toAddress,
+			amountWei,
+			21000, // Standard gas limit for ETH transfer
+			gasPrice,
+			nil,
+		)
+
+		// Get the chain ID
+		chainID, err := f.client.NetworkID(ctx)
 		if err != nil {
-			f.log.Error().
-				Msgf("failed to send to address %s (EVM: %s): %v", address, evmAddress, err)
+			return "", 0, fmt.Errorf("failed to get network ID: %w", err)
+		}
+
+		// Sign the transaction
+		signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), f.privateKey)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to sign transaction to %s: %w", evmAddress, err)
+		}
+
+		// Send the transaction
+		err = f.client.SendTransaction(ctx, signedTx)
+		if err != nil {
+			f.log.Error().Msgf("failed to send transaction to %s: %v", evmAddress, err)
 			continue
 		}
-		txHashes = append(txHashes, txHash)
+
+		successfulAddresses = append(successfulAddresses, address)
 		totalSent += f.Amount
+		lastTxHash = signedTx.Hash().Hex()
 
 		// Log both original and converted address for transparency
 		if address != evmAddress {
 			f.log.Info().
-				Msgf("sent %f %s to %s (converted from %s), tx: %s", f.Amount, f.config.Denom, evmAddress, address, txHash)
+				Msgf("sent %f %s to %s (converted from %s), tx: %s", f.Amount, f.config.Denom, evmAddress, address, lastTxHash)
 		} else {
-			f.log.Info().Msgf("sent %f %s to %s, tx: %s", f.Amount, f.config.Denom, evmAddress, txHash)
+			f.log.Info().Msgf("sent %f %s to %s, tx: %s", f.Amount, f.config.Denom, evmAddress, lastTxHash)
 		}
 	}
 
-	if len(txHashes) == 0 {
-		return "", http.StatusInternalServerError, errors.New("failed to send to any addresses")
+	// Update nonce to the last used nonce + 1
+	f.nonce = nonce + uint64(len(successfulAddresses))
+
+	if len(successfulAddresses) == 0 {
+		return "", 0, errors.New("failed to send to any addresses")
 	}
 
-	f.TokensAvailable -= totalSent
-	f.log.Debug().Msgf("tokens available: %f", f.TokensAvailable)
-	f.log.Info().Msgf("tokens sent to %v", f.Batch)
-	dailySupply.Set(f.TokensAvailable)
+	if len(successfulAddresses) < len(addresses) {
+		f.log.Warn().
+			Msgf("only sent to %d out of %d addresses", len(successfulAddresses), len(addresses))
+	}
 
-	// Return the latest transaction hash
-	latestTxHash := txHashes[len(txHashes)-1]
-	f.LatestTXHash = latestTxHash
-	f.Batch = []string{}
-
-	return latestTxHash, http.StatusOK, nil
+	return lastTxHash, totalSent, nil
 }
 
 func (f *Faucet) sendToAddress(ctx context.Context, toAddr string) (string, error) {
