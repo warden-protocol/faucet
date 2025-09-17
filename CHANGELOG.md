@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3](https://github.com/warden-protocol/faucet/compare/v1.0.2...v1.0.3) (2025-09-17)
+
+
+### Bug Fixes
+
+* batch sending not working as expected ([02d45cb](https://github.com/warden-protocol/faucet/commit/02d45cbb99d009e5839c84fcbd57ff888291f6b3))
+
 ## [1.0.2](https://github.com/warden-protocol/faucet/compare/v1.0.1...v1.0.2) (2025-09-15)
 
 
