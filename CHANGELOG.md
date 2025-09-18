@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.6](https://github.com/warden-protocol/faucet/compare/v1.0.5...v1.0.6) (2025-09-18)
+
+
+### Bug Fixes
+
+* nonce and logic fixes ([#7](https://github.com/warden-protocol/faucet/issues/7)) ([c6aa590](https://github.com/warden-protocol/faucet/commit/c6aa5906678a70275613f85e3cbda55602aa9d6e))
+
 ## [1.0.5](https://github.com/warden-protocol/faucet/compare/v1.0.4...v1.0.5) (2025-09-17)
 
 
