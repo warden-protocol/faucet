@@ -18,24 +18,24 @@ func configError(msg string) error {
 }
 
 type Config struct {
-	Port             string        `env:"PORT"              envDefault:"8081"                                 mapstructure:"PORT"`
+	Port string `env:"PORT" envDefault:"8081" mapstructure:"PORT"`
 	EnvFile          string        `env:"ENV_FILE"          envDefault:""`
-	PurgeInterval    string        `env:"PURGE_INTERVAL"    envDefault:"10s"                                  mapstructure:"PURGE_INTERVAL"`
-	PrivateKey       string        `env:"PRIVATE_KEY"       envDefault:""                                     mapstructure:"PRIVATE_KEY"`
-	Node             string        `env:"NODE"              envDefault:"https://evm.barra.wardenprotocol.org" mapstructure:"NODE"`
-	ChainID          int64         `env:"CHAIN_ID"          envDefault:"9191"                                 mapstructure:"CHAIN_ID"`
-	Denom            string        `env:"DENOM"             envDefault:"WARD"                                 mapstructure:"DENOM"`
-	Amount           float64       `env:"AMOUNT"            envDefault:"0.1"                                  mapstructure:"AMOUNT"`
-	BatchInterval    time.Duration `env:"BATCH_INTERVAL"    envDefault:"5s"                                   mapstructure:"BATCH_INTERVAL"`
-	DailyLimit       int64         `env:"DAILY_LIMIT"       envDefault:"10"                                   mapstructure:"DAILY_LIMIT"`
-	BatchLimit       int           `env:"BATCH_LIMIT"       envDefault:"10"                                   mapstructure:"BATCH_LIMIT"`
-	TXRetry          int           `env:"TX_RETRY"          envDefault:"10"                                   mapstructure:"TX_RETRY"`
-	Chain            string        `env:"CHAIN"             envDefault:"Barra"                                mapstructure:"CHAIN"`
-	Exponent         int           `env:"EXPONENT"          envDefault:"18"                                   mapstructure:"EXPONENT"`
-	DisplayTokens    bool          `env:"DISPLAY_TOKENS"    envDefault:"false"                                mapstructure:"DISPLAY_TOKENS"`
-	Blacklist        string        `env:"BLACKLIST"         envDefault:""                                     mapstructure:"BLACKLIST"`
-	LogLevel         string        `env:"LOG_LEVEL"         envDefault:"Info"                                 mapstructure:"LOG_LEVEL"`
-	AcceptedPrefixes string        `env:"ACCEPTED_PREFIXES" envDefault:"warden"                               mapstructure:"ACCEPTED_PREFIXES"`
+	PurgeInterval string `env:"PURGE_INTERVAL" envDefault:"10s" mapstructure:"PURGE_INTERVAL"`
+	PrivateKey string `env:"PRIVATE_KEY" envDefault:"" mapstructure:"PRIVATE_KEY"`
+	Node string `env:"NODE" envDefault:"https://evm.barra.wardenprotocol.org" mapstructure:"NODE"`
+	ChainID int64 `env:"CHAIN_ID" envDefault:"9191" mapstructure:"CHAIN_ID"`
+	Denom string `env:"DENOM" envDefault:"WARD" mapstructure:"DENOM"`
+	Amount float64 `env:"AMOUNT" envDefault:"0.1" mapstructure:"AMOUNT"`
+	BatchInterval time.Duration `env:"BATCH_INTERVAL" envDefault:"5s" mapstructure:"BATCH_INTERVAL"`
+	DailyLimit int64 `env:"DAILY_LIMIT" envDefault:"10" mapstructure:"DAILY_LIMIT"`
+	BatchLimit int `env:"BATCH_LIMIT" envDefault:"10" mapstructure:"BATCH_LIMIT"`
+	TXRetry int `env:"TX_RETRY" envDefault:"10" mapstructure:"TX_RETRY"`
+	Chain string `env:"CHAIN" envDefault:"Barra" mapstructure:"CHAIN"`
+	Exponent int `env:"EXPONENT" envDefault:"18" mapstructure:"EXPONENT"`
+	DisplayTokens bool `env:"DISPLAY_TOKENS" envDefault:"false" mapstructure:"DISPLAY_TOKENS"`
+	Blacklist string `env:"BLACKLIST" envDefault:"" mapstructure:"BLACKLIST"`
+	LogLevel string `env:"LOG_LEVEL" envDefault:"Info" mapstructure:"LOG_LEVEL"`
+	AcceptedPrefixes string `env:"ACCEPTED_PREFIXES" envDefault:"warden" mapstructure:"ACCEPTED_PREFIXES"`
 }
 
 func GetLogLevel() string {
