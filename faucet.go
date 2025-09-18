@@ -40,7 +40,6 @@ type Faucet struct {
 	LatestTXHash    string
 	DisplayTokens   bool
 	nonce           uint64
-	nonceMutex      sync.Mutex // Separate mutex for nonce management
 }
 
 const (
@@ -133,6 +132,82 @@ func (f *Faucet) getAndIncrementNonce(ctx context.Context, count uint64) (uint64
 
 	f.log.Debug().Msgf("allocated nonce range %d-%d", currentNonce, currentNonce+count-1)
 	return currentNonce, nil
+}
+
+// waitForTransactionReceipt waits for a transaction to be mined and confirmed
+func (f *Faucet) waitForTransactionReceipt(
+	ctx context.Context,
+	txHash common.Hash,
+	timeout time.Duration,
+) error {
+	f.log.Debug().Msgf("waiting for transaction receipt: %s", txHash.Hex())
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("transaction %s not mined within %v", txHash.Hex(), timeout)
+		case <-ticker.C:
+			receipt, err := f.client.TransactionReceipt(waitCtx, txHash)
+			if err != nil {
+				// Transaction not yet mined, continue waiting
+				continue
+			}
+
+			if receipt.Status == 0 {
+				return fmt.Errorf("transaction %s failed (status: 0)", txHash.Hex())
+			}
+
+			f.log.Info().
+				Msgf("transaction %s confirmed in block %d", txHash.Hex(), receipt.BlockNumber.Uint64())
+			return nil
+		}
+	}
+}
+
+// validateProductionConfig checks if the configuration is suitable for production
+func validateProductionConfig(cfg config.Config, logger zerolog.Logger) {
+	warnings := []string{}
+
+	if cfg.BatchInterval < 30*time.Second {
+		warnings = append(
+			warnings,
+			fmt.Sprintf(
+				"BatchInterval (%v) is very short, consider at least 30s for production",
+				cfg.BatchInterval,
+			),
+		)
+	}
+
+	if cfg.BatchLimit > 10 {
+		warnings = append(
+			warnings,
+			fmt.Sprintf(
+				"BatchLimit (%d) is high, consider reducing for better reliability",
+				cfg.BatchLimit,
+			),
+		)
+	}
+
+	if cfg.DailyLimit > 100000 {
+		warnings = append(
+			warnings,
+			fmt.Sprintf("DailyLimit (%d) is very high, ensure sufficient funds", cfg.DailyLimit),
+		)
+	}
+
+	for _, warning := range warnings {
+		logger.Warn().Msg(warning)
+	}
+
+	if len(warnings) > 0 {
+		logger.Info().Msg("Consider adjusting configuration for production environment")
+	}
 }
 
 func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
