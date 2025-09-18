@@ -3,12 +3,15 @@ module github.com/warden-protocol/faucet
 go 1.25.1
 
 require (
+	github.com/caarlos0/env/v10 v10.0.0
 	github.com/cosmos/cosmos-sdk v0.53.4
 	github.com/ethereum/go-ethereum v1.16.3
 	github.com/labstack/echo/v4 v4.13.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
+	github.com/spf13/viper v1.20.1
 	github.com/warden-protocol/wardenprotocol v0.6.5
+	golang.org/x/time v0.11.0
 )
 
 require (
@@ -16,7 +19,6 @@ require (
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect
-	github.com/caarlos0/env/v10 v10.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/consensys/gnark-crypto v0.18.0 // indirect
 	github.com/cosmos/btcutil v1.0.5 // indirect
@@ -45,7 +47,6 @@ require (
 	github.com/spf13/afero v1.12.0 // indirect
 	github.com/spf13/cast v1.9.2 // indirect
 	github.com/spf13/pflag v1.0.7 // indirect
-	github.com/spf13/viper v1.20.1 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/supranational/blst v0.3.14 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
@@ -59,7 +60,6 @@ require (
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
-	golang.org/x/time v0.11.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

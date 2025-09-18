@@ -24,6 +24,7 @@ import (
 
 type Faucet struct {
 	*sync.Mutex
+	nonceMutex sync.Mutex // Separate mutex for nonce management
 
 	log             zerolog.Logger
 	config          config.Config
@@ -105,6 +106,30 @@ func convertCosmosToEVM(bech32Addr string) (string, error) {
 	}
 
 	return addr.Hex(), nil
+}
+
+// getAndIncrementNonce safely gets and increments nonce for concurrent access
+func (f *Faucet) getAndIncrementNonce(ctx context.Context, count uint64) (uint64, error) {
+	f.nonceMutex.Lock()
+	defer f.nonceMutex.Unlock()
+
+	// Get fresh nonce from network periodically to stay in sync
+	pendingNonce, err := f.client.PendingNonceAt(ctx, f.fromAddress)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get pending nonce: %w", err)
+	}
+
+	// Use the maximum of our tracked nonce and the network nonce
+	if pendingNonce > f.nonce {
+		f.log.Debug().Msgf("updating tracked nonce from %d to %d", f.nonce, pendingNonce)
+		f.nonce = pendingNonce
+	}
+
+	currentNonce := f.nonce
+	f.nonce += count // Reserve the next 'count' nonces
+
+	f.log.Debug().Msgf("allocated nonce range %d-%d", currentNonce, currentNonce+count-1)
+	return currentNonce, nil
 }
 
 func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
@@ -226,14 +251,16 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 	const gasPriceMultiplier = 1.2 // Increase gas price by 20% on retry
 
 	var lastErr error
+	addressCount := uint64(len(addresses))
 
 	for retry := 0; retry < maxRetries; retry++ {
-		// Get fresh nonce for each retry to avoid conflicts
-		nonce, err := f.client.PendingNonceAt(ctx, f.fromAddress)
+		// Get nonce range for this batch using thread-safe function
+		nonce, err := f.getAndIncrementNonce(ctx, addressCount)
 		if err != nil {
-			return "", 0, fmt.Errorf("failed to get nonce: %w", err)
+			lastErr = fmt.Errorf("failed to get nonce: %w", err)
+			f.log.Error().Msgf("retry %d: %v", retry+1, lastErr)
+			continue
 		}
-		f.nonce = nonce
 
 		// Get current gas price and increase if retrying
 		gasPrice, err := f.client.SuggestGasPrice(ctx)
@@ -347,8 +374,7 @@ func (f *Faucet) sendBatchTransaction(
 		}
 	}
 
-	// Update nonce to the last used nonce + 1
-	f.nonce = nonce + uint64(len(successfulAddresses))
+	// Nonce is already managed by getAndIncrementNonce function
 
 	if len(successfulAddresses) == 0 {
 		return "", 0, errors.New("failed to send to any addresses")

@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/rs/zerolog"
+	"golang.org/x/time/rate"
 
 	"github.com/warden-protocol/wardenprotocol/cmd/faucet/pkg/config"
 )
@@ -81,6 +83,33 @@ func newPage() Page {
 	}
 }
 
+// RateLimitMiddleware creates a rate limiting middleware
+func RateLimitMiddleware(rps int, burst int) echo.MiddlewareFunc {
+	var mu sync.Mutex
+	clients := make(map[string]*rate.Limiter)
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+
+			mu.Lock()
+			if _, exists := clients[ip]; !exists {
+				clients[ip] = rate.NewLimiter(rate.Limit(rps), burst)
+			}
+			clientLimiter := clients[ip]
+			mu.Unlock()
+
+			if !clientLimiter.Allow() {
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error": "Rate limit exceeded. Please try again later.",
+				})
+			}
+
+			return next(c)
+		}
+	}
+}
+
 func main() {
 	ctx := context.Background()
 	e := echo.New()
@@ -99,6 +128,14 @@ func main() {
 	if logger.GetLevel() == log.DebugLevel {
 		e.Use(middleware.Logger())
 	}
+
+	// Add rate limiting: 10 requests per second per IP, burst of 20
+	e.Use(RateLimitMiddleware(10, 20))
+
+	// Add timeout middleware to prevent hanging requests
+	e.Use(middleware.TimeoutWithConfig(middleware.TimeoutConfig{
+		Timeout: 30 * time.Second,
+	}))
 
 	e.Use(middleware.CSRFWithConfig(middleware.CSRFConfig{
 		TokenLookup: "header:X-CSRF-Token",
@@ -145,7 +182,9 @@ func main() {
 			return c.Render(http.StatusInternalServerError, "index", page)
 		}
 
-		page.Form.CSRFToken = c.Get("csrf").(string)
+		if csrfToken := c.Get("csrf"); csrfToken != nil {
+			page.Form.CSRFToken = csrfToken.(string)
+		}
 		page.Form.Address = c.QueryParam("addr")
 		logger.Debug().Msgf("page.Form: %v", page.Form)
 
@@ -166,18 +205,25 @@ func main() {
 
 	e.POST("/send-tokens", func(c echo.Context) error {
 		var txHash string
-
 		var httpStatusCode int
 
 		reqCount.Inc()
 
-		txHash, httpStatusCode, err = f.Send(c.Request().Context(), c.FormValue("address"), false)
+		// Add timeout context for the request
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 25*time.Second)
+		defer cancel()
+
+		txHash, httpStatusCode, err = f.Send(ctx, c.FormValue("address"), false)
 		if err != nil {
 			logger.Error().Msgf("error sending tokens: %s", err)
 
 			formData := newFormData()
 			formData.Address = c.FormValue("address") // Preserve the entered address
-			formData.CSRFToken = c.Get("csrf").(string) // Include CSRF token
+
+			// Safe CSRF token handling
+			if csrfToken := c.Get("csrf"); csrfToken != nil {
+				formData.CSRFToken = csrfToken.(string)
+			}
 			formData.Errors["address"] = err.Error()
 
 			return c.Render(httpStatusCode, "form", formData)
@@ -191,7 +237,9 @@ func main() {
 
 			// Return a fresh form with new CSRF token for next submission
 			formData := newFormData()
-			formData.CSRFToken = c.Get("csrf").(string)
+			if csrfToken := c.Get("csrf"); csrfToken != nil {
+				formData.CSRFToken = csrfToken.(string)
+			}
 			return c.Render(http.StatusOK, "form", formData)
 		}
 
