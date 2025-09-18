@@ -82,7 +82,7 @@ func validAddress(addr string, config config.Config) error {
 	)
 }
 
-// convertCosmosToEVM converts a Cosmos bech32 address to an Ethereum address
+// convertCosmosToEVM converts a Cosmos bech32 address to an Ethereum address.
 func convertCosmosToEVM(bech32Addr string) (string, error) {
 	if common.IsHexAddress(bech32Addr) {
 		// Already an EVM address
@@ -97,20 +97,21 @@ func convertCosmosToEVM(bech32Addr string) (string, error) {
 
 	// Convert to Ethereum address
 	var addr common.Address
-	if len(addrBytes) == 20 {
+	switch len(addrBytes) {
+	case 20:
 		// Direct 20-byte address
 		copy(addr[:], addrBytes)
-	} else if len(addrBytes) == 32 {
+	case 32:
 		// Take last 20 bytes if it's a 32-byte address
 		copy(addr[:], addrBytes[12:])
-	} else {
+	default:
 		return "", fmt.Errorf("invalid address length: %d bytes", len(addrBytes))
 	}
 
 	return addr.Hex(), nil
 }
 
-// getAndIncrementNonce safely gets and increments nonce for concurrent access
+// getAndIncrementNonce safely gets and increments nonce for concurrent access.
 func (f *Faucet) getAndIncrementNonce(ctx context.Context, count uint64) (uint64, error) {
 	f.nonceMutex.Lock()
 	defer f.nonceMutex.Unlock()
@@ -134,7 +135,26 @@ func (f *Faucet) getAndIncrementNonce(ctx context.Context, count uint64) (uint64
 	return currentNonce, nil
 }
 
-// waitForTransactionReceipt waits for a transaction to be mined and confirmed
+// categorizeError categorizes error types for better debugging.
+func categorizeError(err error) string {
+	errMsg := err.Error()
+	switch {
+	case strings.Contains(errMsg, "nonce"):
+		return "nonce_conflict"
+	case strings.Contains(errMsg, "replacement") || strings.Contains(errMsg, "underpriced"):
+		return "replacement_underpriced"
+	case strings.Contains(errMsg, "insufficient"):
+		return "insufficient_funds"
+	case strings.Contains(errMsg, "gas"):
+		return "gas_related"
+	case strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "context"):
+		return "network_timeout"
+	default:
+		return "unknown"
+	}
+}
+
+// waitForTransactionReceipt waits for a transaction to be mined and confirmed.
 func (f *Faucet) waitForTransactionReceipt(
 	ctx context.Context,
 	txHash common.Hash,
@@ -170,7 +190,7 @@ func (f *Faucet) waitForTransactionReceipt(
 	}
 }
 
-// validateProductionConfig checks if the configuration is suitable for production
+// validateProductionConfig checks if the configuration is suitable for production.
 func validateProductionConfig(cfg config.Config, logger zerolog.Logger) {
 	warnings := []string{}
 
@@ -210,7 +230,7 @@ func validateProductionConfig(cfg config.Config, logger zerolog.Logger) {
 	}
 }
 
-func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
+func InitFaucet(ctx context.Context, logger zerolog.Logger) (*Faucet, error) {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatal().Msgf("error loading config: %s", err)
@@ -222,20 +242,20 @@ func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
 	// Connect to the Ethereum client
 	client, err := ethclient.Dial(cfg.Node)
 	if err != nil {
-		return Faucet{}, fmt.Errorf("failed to connect to the Ethereum client: %w", err)
+		return nil, fmt.Errorf("failed to connect to the Ethereum client: %w", err)
 	}
 
 	// Parse the private key from hex string
 	privateKey, err := crypto.HexToECDSA(cfg.PrivateKey)
 	if err != nil {
-		return Faucet{}, fmt.Errorf("failed to parse private key: %w", err)
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 
 	// Get the public key and address
 	publicKey := privateKey.Public()
 	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
 	if !ok {
-		return Faucet{}, errors.New("failed to cast public key to ECDSA")
+		return nil, errors.New("failed to cast public key to ECDSA")
 	}
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
 
@@ -256,7 +276,7 @@ func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
 	// Get the initial nonce
 	nonce, err := client.PendingNonceAt(ctx, fromAddress)
 	if err != nil {
-		return Faucet{}, fmt.Errorf("failed to get nonce: %w", err)
+		return nil, fmt.Errorf("failed to get nonce: %w", err)
 	}
 	f.nonce = nonce
 
@@ -264,7 +284,7 @@ func InitFaucet(ctx context.Context, logger zerolog.Logger) (Faucet, error) {
 
 	logger.Info().Msgf("EVM Faucet initialized with address: %s", fromAddress.Hex())
 
-	return f, nil
+	return &f, nil
 }
 
 func addressInBatch(batch []string, addr string) bool {
@@ -326,7 +346,7 @@ func (f *Faucet) Send(ctx context.Context, addr string, force bool) (string, int
 	return txHash, http.StatusOK, nil
 }
 
-// sendBatch sends tokens to multiple addresses with robust retry logic
+// sendBatch sends tokens to multiple addresses with robust retry logic.
 func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, float64, error) {
 	const maxRetries = 5
 	const baseGasPriceMultiplier = 2.0 // Start with 100% increase for production
@@ -397,18 +417,7 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 	}
 
 	// Categorize the final error for better debugging
-	errType := "unknown"
-	if strings.Contains(lastErr.Error(), "nonce") {
-		errType = "nonce_conflict"
-	} else if strings.Contains(lastErr.Error(), "replacement") || strings.Contains(lastErr.Error(), "underpriced") {
-		errType = "replacement_underpriced"
-	} else if strings.Contains(lastErr.Error(), "insufficient") {
-		errType = "insufficient_funds"
-	} else if strings.Contains(lastErr.Error(), "gas") {
-		errType = "gas_related"
-	} else if strings.Contains(lastErr.Error(), "timeout") || strings.Contains(lastErr.Error(), "context") {
-		errType = "network_timeout"
-	}
+	errType := categorizeError(lastErr)
 
 	f.log.Error().
 		Msgf("batch transaction failed permanently (type: %s) after %d retries: %v", errType, maxRetries, lastErr)
@@ -420,7 +429,7 @@ func (f *Faucet) sendBatch(ctx context.Context, addresses []string) (string, flo
 	)
 }
 
-// sendBatchTransaction creates and sends a batch transaction to multiple addresses
+// sendBatchTransaction creates and sends a batch transaction to multiple addresses.
 func (f *Faucet) sendBatchTransaction(
 	ctx context.Context,
 	addresses []string,
@@ -453,8 +462,10 @@ func (f *Faucet) sendBatchTransaction(
 		toAddress := common.HexToAddress(evmAddress)
 
 		// Create the transaction with incremented nonce for each address
+		// Safe conversion: i is always positive and within bounds since it's from range
+		txNonce := nonce + uint64(i) //nolint:gosec // i is from range iteration, always safe
 		tx := types.NewTransaction(
-			nonce+uint64(i),
+			txNonce,
 			toAddress,
 			amountWei,
 			21000, // Standard gas limit for ETH transfer
@@ -485,8 +496,8 @@ func (f *Faucet) sendBatchTransaction(
 		f.log.Info().Msgf("transaction submitted to %s: %s", evmAddress, txHash.Hex())
 
 		// Wait for transaction to be mined (with shorter timeout for individual txs)
-		if err := f.waitForTransactionReceipt(ctx, txHash, 60*time.Second); err != nil {
-			f.log.Error().Msgf("transaction to %s failed to confirm: %v", evmAddress, err)
+		if waitErr := f.waitForTransactionReceipt(ctx, txHash, 60*time.Second); waitErr != nil {
+			f.log.Error().Msgf("transaction to %s failed to confirm: %v", evmAddress, waitErr)
 			continue
 		}
 
@@ -516,59 +527,8 @@ func (f *Faucet) sendBatchTransaction(
 	return lastTxHash, totalSent, nil
 }
 
-func (f *Faucet) sendToAddress(ctx context.Context, toAddr string) (string, error) {
-	toAddress := common.HexToAddress(toAddr)
 
-	// Convert amount to wei
-	amount := new(big.Float).SetFloat64(f.config.Amount)
-	multiplierInt := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(f.config.Exponent)), nil)
-	multiplier := new(big.Float).SetInt(multiplierInt)
-	amount.Mul(amount, multiplier)
-
-	amountWei := new(big.Int)
-	amount.Int(amountWei)
-
-	// Get current gas price
-	gasPrice, err := f.client.SuggestGasPrice(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to suggest gas price: %w", err)
-	}
-
-	// Create the transaction
-	tx := types.NewTransaction(
-		f.nonce,
-		toAddress,
-		amountWei,
-		21000, // Standard gas limit for ETH transfer
-		gasPrice,
-		nil,
-	)
-
-	// Get the chain ID
-	chainID, err := f.client.NetworkID(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to get network ID: %w", err)
-	}
-
-	// Sign the transaction
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), f.privateKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to sign transaction: %w", err)
-	}
-
-	// Send the transaction
-	err = f.client.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return "", fmt.Errorf("failed to send transaction: %w", err)
-	}
-
-	// Increment nonce for next transaction
-	f.nonce++
-
-	return signedTx.Hash().Hex(), nil
-}
-
-// DailyRefresh resets the available tokens daily
+// DailyRefresh resets the available tokens daily.
 func (f *Faucet) DailyRefresh() {
 	for {
 		now := time.Now()
